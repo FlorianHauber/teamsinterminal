@@ -28,7 +28,7 @@ from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "1.2"
+VERSION = "1.3"
 APP = "teams-cli"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / APP
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -36,6 +36,7 @@ DATA_DIR = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "sha
 PROFILE_DIR = DATA_DIR / "chrome-profile"
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / APP
 HISTORY_FILE = STATE_DIR / "history"
+ASSIGN_CACHE = STATE_DIR / "assignments.json"
 MOODLE_CFG = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "moodle-cli" / "config.json"
 
 # --------------------------------------------------------------------------- #
@@ -1427,7 +1428,7 @@ class TeamsWeb:
                 links.append(f"https://forms.office.com/Pages/ResponsePage.aspx?id={fid}")
             out.append({"id": d.get("id"), "title": d.get("displayName") or "", "due": due,
                         "class": classes.get(d.get("classId"), ""), "status": sstat or d.get("status") or "",
-                        "bucket": bucket, "text": text, "forms": list(dict.fromkeys(links)),
+                        "bucket": bucket, "done": bool(done), "text": text, "forms": list(dict.fromkeys(links)),
                         "points": points, "max": maxp, "web": sub.get("webUrl") or d.get("webUrl")})
         for a in out:
             for u in a["forms"]:
@@ -2082,7 +2083,12 @@ class Shell(cmd.Cmd):
 
     def do_assignments(self, arg):
         """assignments [--done] — your assignments: to do, missed, and (with --done) done."""
+        old = (load_assign_cache() or {}).get("items") or []
         items = self.web.assignments()
+        save_assign_cache(items)
+        added, changed = diff_assignments(old, items) if old else (set(), set())
+        if old:
+            print(dim(f"{len(added)} new, {len(changed)} changed since last time"))
         show = ("due", "missed", "done") if "--done" in arg else ("due", "missed")
         for k, label, col in (("due", "To do", yellow), ("missed", "Missed", red), ("done", "Done", green)):
             group = [a for a in items if a["bucket"] == k]
@@ -2093,7 +2099,8 @@ class Shell(cmd.Cmd):
                 print(dim("  `assignments --done` lists them"))
                 continue
             for a in group:
-                print(f"  {bold(a['title'])}  {cyan(a['class'])}  {dim(fmt_due(a['due']))}"
+                tag = magenta("  new") if a["id"] in added else yellow("  changed") if a["id"] in changed else ""
+                print(f"  {bold(a['title'])}  {cyan(a['class'])}  {dim(fmt_due(a['due']))}{tag}"
                       + (f"  {green(score_text(a))}" if score_text(a) else ""))
                 for u in a["forms"]:
                     print(yellow(f"     ▶ Form: {u}"))
@@ -2617,6 +2624,52 @@ class FormsView(View):
         return False
 
 
+def load_assign_cache():
+    try:
+        c = json.loads(ASSIGN_CACHE.read_text())
+        return c if isinstance(c.get("items"), list) else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def save_assign_cache(items):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = ASSIGN_CACHE.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"time": int(time.time()), "items": items}, ensure_ascii=False))
+    os.chmod(tmp, 0o600)
+    tmp.replace(ASSIGN_CACHE)
+
+
+def rebucket(items):
+    """Due dates pass while the cache sits on disk: work out to do / missed again from the clock."""
+    now = datetime.now().astimezone()
+    for a in items:
+        if a.get("done"):
+            a["bucket"] = "done"
+            continue
+        try:
+            late = bool(a.get("due")) and datetime.fromisoformat(a["due"].replace("Z", "+00:00")) < now
+        except ValueError:
+            late = False
+        a["bucket"] = "missed" if late else "due"
+    return items
+
+
+def diff_assignments(old, new):
+    """Ids that are new, and ids whose status or points changed."""
+    before = {a["id"]: a for a in old}
+    added = {a["id"] for a in new if a["id"] not in before}
+    changed = {a["id"] for a in new if a["id"] in before and
+               (before[a["id"]].get("status"), before[a["id"]].get("points"), before[a["id"]].get("due"))
+               != (a.get("status"), a.get("points"), a.get("due"))}
+    return added, changed
+
+
+def ago(ts):
+    m = int((time.time() - ts) // 60)
+    return "just now" if m < 1 else f"{m} min ago" if m < 60 else f"{m // 60} h ago" if m < 1440 else f"{m // 1440} days ago"
+
+
 def fmt_due(iso):
     """'in 3 days', 'tomorrow 23:59', '2 days ago' next to the date."""
     if not iso:
@@ -2646,19 +2699,46 @@ class AssignmentsView(View):
         super().__init__(app, "Assignments")
         self.show_done = False
         self.items = None
+        self.updated = None       # time of the last download from Teams
+        self.pending = False      # True: cached list is on screen, check Teams after drawing it
+        self.added, self.changed = set(), set()
+
+    def update(self):
+        """Download the list again and mark what is new or changed since the cached copy."""
+        self.app.status(dim("checking Teams for new assignments…" if self.items else "loading your assignments…"))
+        new = self.sh.web.assignments()
+        if self.items:
+            self.added, self.changed = diff_assignments(self.items, new)
+        self.items, self.updated = new, time.time()
+        save_assign_cache(new)
+        n, c = len(self.added), len(self.changed)
+        return green(f"✓ {n} new, {c} changed") if n or c else dim("✓ up to date")
+
+    def check(self):
+        """Run by the main loop right after the cached list was drawn."""
+        self.pending = False
+        msg = self.update()
+        self.all_rows = self.build()
+        self.apply_filter(self.sel)
+        self.app.msg = msg
 
     def build(self):
+        if self.items is None and not self.fresh:
+            c = load_assign_cache()
+            if c:
+                self.items, self.updated, self.pending = c["items"], c["time"], True
         if self.items is None or self.fresh:
-            self.app.status(dim("loading your assignments…"))
-            self.items = self.sh.web.assignments()
+            self.app.msg = self.update() if self.items else ""
         self.fresh = False
+        rebucket(self.items)
         groups = {k: [a for a in self.items if a["bucket"] == k] for k, _ in self.BUCKETS}
         groups["missed"].reverse()                      # most recent first
         groups["done"].sort(key=lambda a: a["due"] or "", reverse=True)
-        rows = []
+        rows = [Row(dim(f"  {len(self.items)} assignments · updated {ago(self.updated)}"
+                        + ("  · checking for new ones…" if self.pending else "  · r checks again"))), Row("")]
         for k, label in self.BUCKETS:
             items = groups[k]
-            if rows:
+            if len(rows) > 2:
                 rows.append(Row(""))
             rows.append(head(f"{label}  ·  {len(items)}"))
             if k == "done" and not self.show_done:
@@ -2674,7 +2754,8 @@ class AssignmentsView(View):
     def row(self, a):
         mark = {"due": yellow("○"), "missed": red("✗"), "done": green("✓")}[a["bucket"]]
         when = (red if a["bucket"] == "missed" else dim)(fmt_due(a["due"]))
-        extra = (yellow("  ▶ Form") if a["forms"] else "") + (f"  {green(score_text(a))}" if score_text(a) else "")
+        extra = (magenta(bold("  new")) if a["id"] in self.added else yellow("  changed") if a["id"] in self.changed else "")
+        extra += (yellow("  ▶ Form") if a["forms"] else "") + (f"  {green(score_text(a))}" if score_text(a) else "")
         title = a["title"].strip()
         title = title if len(title) <= 46 else title[:45] + "…"
         cls = cyan(a["class"][:16].ljust(16)) if a["class"] else " " * 16
@@ -2789,6 +2870,14 @@ class TUI:
         self.switch(0)
         while True:
             self.draw()
+            v = self.view
+            if getattr(v, "pending", False):   # cached list is on screen: now ask Teams for changes
+                try:
+                    v.check()
+                except Exception as e:
+                    v.pending = False
+                    self.msg = red("could not check for new assignments: " + str(e).split("\n")[0])
+                continue
             try:
                 k = scr.get_wch()
             except KeyboardInterrupt:
