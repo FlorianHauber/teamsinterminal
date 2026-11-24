@@ -2,14 +2,43 @@
 
 Microsoft Teams files and Forms tests in the terminal.
 
-- `teams_cli.py`: signs in with a normal school account in a hidden Chrome window (Playwright). Lists and downloads team files from SharePoint and fills Forms tests question by question. Needs no app registration or admin consent.
-- `teams_tui.py`: Textual TUI over Microsoft Graph (MSAL login). Needs an Azure app client id via `TEAMS_TUI_CLIENT_ID`.
+- `teams` (`teams_cli.py`): signs in with a normal school account in a hidden Chrome window (Playwright). Lists and downloads team files from SharePoint and fills Forms tests question by question. Needs no app registration or admin consent.
+- `teams-tui` (`teams_tui.py`): Textual TUI over Microsoft Graph (MSAL login). Needs an Azure app client id via `TEAMS_TUI_CLIENT_ID`.
 
 ## Install
 
+Needs Linux or macOS with Python 3.10+ and git. No root needed.
+
 ```sh
-python -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/playwright install chromium
-.venv/bin/python teams_cli.py login
+curl -fsSL https://raw.githubusercontent.com/FlorianHauber/teamsinterminal/main/install.sh | sh
+```
+
+The script does this:
+
+1. Clones the repo into `~/.local/share/teamsinterminal` (or updates it).
+2. Creates a virtual environment there and installs `requirements.txt`.
+3. Downloads Chromium for Playwright, unless Google Chrome is installed.
+4. Puts `teams` and `teams-tui` into `~/.local/bin`.
+
+From a clone instead:
+
+```sh
+git clone https://github.com/FlorianHauber/teamsinterminal.git
+cd teamsinterminal
+./install.sh
+```
+
+Run the same command again to update.
+
+## Use
+
+```sh
+teams login     # e-mail, password, MFA in the terminal
+teams           # interactive shell, type "help"
+```
+
+## Uninstall
+
+```sh
+rm -rf ~/.local/bin/teams ~/.local/bin/teams-tui ~/.local/share/teamsinterminal
 ```
