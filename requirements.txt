@@ -1,0 +1,4 @@
+playwright
+msal
+httpx
+textual
