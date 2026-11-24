@@ -28,7 +28,7 @@ from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "1.1"
+VERSION = "1.2"
 APP = "teams-cli"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / APP
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -1351,44 +1351,88 @@ class TeamsWeb:
         return {u: f for u, f in self.forms.items() if f["where"].startswith(team["name"] + " ›")}
 
     # -- assignments -------------------------------------------------------- #
+    EDU_API = "https://assignments.edu.cloud.microsoft/api/v1.0/edu/me/work"
+
+    def _on_edu_request(self, r):
+        if "/edu/me/" in r.url:
+            try:
+                h = r.headers
+            except Exception:
+                return
+            if "authorization" in h:
+                self.edu_auth = {k: v for k, v in h.items() if k == "authorization" or k.startswith("x-")}
+
+    def edu_token(self):
+        """The Assignments app's sign-in header: open the app once from the Teams sidebar and copy it."""
+        if getattr(self, "edu_auth", None):
+            return self.edu_auth
+        self.edu_auth = None
+        if not getattr(self, "edu_hooked", False):
+            self.b.ctx.on("request", self._on_edu_request)
+            self.edu_hooked = True
+        btn = self.pg.locator('[aria-label*="Assignments"], [aria-label*="Aufgaben"], '
+                              'button:has-text("Assignments"), button:has-text("Aufgaben")').first
+        try:
+            btn.click(timeout=15000)
+        except Exception:
+            raise TeamsError("the Assignments button was not found in Teams")
+        end = time.time() + 25
+        while not self.edu_auth and time.time() < end:
+            self.pg.wait_for_timeout(250)
+        if not self.edu_auth:
+            raise TeamsError("the Assignments app did not load")
+        return self.edu_auth
+
     def assignments(self):
+        """Only your own assignments, each with a bucket: 'due', 'missed' or 'done'."""
         self.boot()
-        mark = len(self.caps)
-        self.pg.goto(f"https://teams.microsoft.com/l/app/{self.ASSIGNMENTS_APP}", wait_until="commit", timeout=60000)
-
-        def found():
-            return len(self._assignments(mark))
-        self.wait(self.pg, 45, found, stable=4)
-        return self._assignments(mark)
-
-    def _assignments(self, since):
-        out = {}
-        for c in self.caps[since:]:
-            for d in walk_dicts(c["data"]):
-                if not (isinstance(d.get("displayName"), str) and "dueDateTime" in d):
-                    continue
-                aid = str(d.get("id") or d["displayName"])
-                instr = d.get("instructions")
-                text = html2text(instr.get("content"))[0] if isinstance(instr, dict) else ""
-                blob = json.dumps(d, ensure_ascii=False)
-                links = forms_links(blob)
-                fid = find_key(d, r"formid|formsid")
-                if fid and len(fid) > 20:
-                    links.append(f"https://forms.office.com/Pages/ResponsePage.aspx?id={fid}")
-                sub = d.get("submissions") or d.get("submission")
-                status = d.get("status") or ""
-                if isinstance(sub, list) and sub and isinstance(sub[0], dict):
-                    status = sub[0].get("status") or status
-                elif isinstance(sub, dict):
-                    status = sub.get("status") or status
-                out[aid] = {"id": aid, "title": d["displayName"], "due": d.get("dueDateTime"),
-                            "class": d.get("className") or find_key(d, "classname|classdisplayname") or "",
-                            "status": str(status), "text": text, "forms": list(dict.fromkeys(links)),
-                            "points": find_key(d, "maxpoints") or ""}
-        for a in out.values():
+        url = self.EDU_API + "?$top=100&$expand=" + urllib.parse.quote("submissions($expand=outcomes)")
+        raw, retried = [], False
+        while url:
+            r = self.b.ctx.request.get(url, headers=self.edu_token(), fail_on_status_code=False)
+            if r.status == 401 and not retried:
+                self.edu_auth, retried = None, True
+                continue
+            if r.status != 200:
+                raise TeamsError(f"Assignments {r.status}: {r.status_text}")
+            d = r.json()
+            raw += d.get("value") or []
+            url = d.get("@odata.nextLink")
+        classes = {j["groupId"]: course_name(j["name"]) for j in self.joined() if j.get("groupId")}
+        now = datetime.now().astimezone()
+        out = []
+        for d in raw:
+            if d.get("status") == "draft":
+                continue
+            subs = d.get("submissions") or []
+            sub = subs[0] if subs and isinstance(subs[0], dict) else {}
+            sstat = sub.get("status") or ""
+            due = sub.get("extendedDueDateTime") or d.get("dueDateTime")
+            try:
+                late = bool(due) and datetime.fromisoformat(due.replace("Z", "+00:00")) < now
+            except ValueError:
+                late = False
+            done = sstat in ("submitted", "returned", "excused") or d.get("isCompleted")
+            bucket = "done" if done else "missed" if late else "due"
+            points, maxp = None, (d.get("grading") or {}).get("maxPoints") if isinstance(d.get("grading"), dict) else None
+            for o in sub.get("outcomes") or []:
+                pts = o.get("points") if isinstance(o, dict) else None
+                if isinstance(pts, dict) and pts.get("points") is not None:
+                    points = pts["points"]
+            instr = d.get("instructions")
+            text = html2text(instr.get("content"))[0] if isinstance(instr, dict) else ""
+            links = forms_links(json.dumps(d, ensure_ascii=False))
+            fid = find_key(d, r"formid|formsid")
+            if fid and len(fid) > 20:
+                links.append(f"https://forms.office.com/Pages/ResponsePage.aspx?id={fid}")
+            out.append({"id": d.get("id"), "title": d.get("displayName") or "", "due": due,
+                        "class": classes.get(d.get("classId"), ""), "status": sstat or d.get("status") or "",
+                        "bucket": bucket, "text": text, "forms": list(dict.fromkeys(links)),
+                        "points": points, "max": maxp, "web": sub.get("webUrl") or d.get("webUrl")})
+        for a in out:
             for u in a["forms"]:
                 self.forms.setdefault(u, {"label": a["title"], "where": a["class"] or "Assignments", "time": a["due"] or ""})
-        return sorted(out.values(), key=lambda a: a["due"] or "9999")
+        return sorted(out, key=lambda a: a["due"] or "9999")
 
     # -- diagnostics -------------------------------------------------------- #
     def doctor(self):
@@ -1479,7 +1523,7 @@ HELP = f"""
 
 {bold('Posts, assignments, Forms tests')}
   posts [n]              channels of the open team / posts of channel n (Forms links marked ▶)
-  assignments            assignments from the Teams Assignments app
+  assignments [--done]   your assignments: to do, missed (and done)
   forms                  all Forms links found so far
   form <url>             answer a Microsoft Forms quiz/test in the terminal
   doctor                 check that the Teams web app loads (needed for posts/assignments)
@@ -2037,11 +2081,22 @@ class Shell(cmd.Cmd):
         page("\n".join(out) or dim("no posts loaded"))
 
     def do_assignments(self, arg):
-        """List assignments shown by the Teams Assignments app."""
-        for a in self.web.assignments():
-            print(f"  {bold(a['title'])}  {dim(fmt_time(a['due']))}  {dim(a['class'])}  {dim(a['status'])}")
-            for u in a["forms"]:
-                print(yellow(f"     ▶ Form: {u}"))
+        """assignments [--done] — your assignments: to do, missed, and (with --done) done."""
+        items = self.web.assignments()
+        show = ("due", "missed", "done") if "--done" in arg else ("due", "missed")
+        for k, label, col in (("due", "To do", yellow), ("missed", "Missed", red), ("done", "Done", green)):
+            group = [a for a in items if a["bucket"] == k]
+            if k == "missed" or k == "done":
+                group.reverse()
+            print(col(bold(f"{label} ({len(group)})")))
+            if k not in show:
+                print(dim("  `assignments --done` lists them"))
+                continue
+            for a in group:
+                print(f"  {bold(a['title'])}  {cyan(a['class'])}  {dim(fmt_due(a['due']))}"
+                      + (f"  {green(score_text(a))}" if score_text(a) else ""))
+                for u in a["forms"]:
+                    print(yellow(f"     ▶ Form: {u}"))
 
     def do_doctor(self, arg):
         """Check whether the Teams web app (posts, assignments) loads in the hidden browser."""
@@ -2083,7 +2138,7 @@ Actions (the bottom line shows the ones for the current screen)
   Team / folder        Enter open   d  download   a  download everything here   o  open file
   Channel              Enter on a post: read it with replies   Enter on ▶ Form: take the test
   Forms                Enter take the test in the terminal   p  paste a Forms link
-  Assignments          Enter details and the Forms test of the assignment
+  Assignments          To do, Missed, Done.  Enter details   o open in Teams   D show done
 
 Files go to ~/Moodle/<subject> (the same folder moodle-cli uses). The subject folder
 is asked once per team and remembered; `m` changes it.
@@ -2562,46 +2617,117 @@ class FormsView(View):
         return False
 
 
+def fmt_due(iso):
+    """'in 3 days', 'tomorrow 23:59', '2 days ago' next to the date."""
+    if not iso:
+        return "no due date"
+    try:
+        t = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        return iso
+    days = (t.date() - datetime.now().astimezone().date()).days
+    rel = ("today" if days == 0 else "tomorrow" if days == 1 else "yesterday" if days == -1 else
+           f"in {days} days" if days > 0 else f"{-days} days ago")
+    return f"{t.strftime('%a %d %b %H:%M')}  ·  {rel}"
+
+
+def score_text(a):
+    if a.get("points") is None:
+        return ""
+    p = f"{a['points']:g}" if isinstance(a["points"], (int, float)) else str(a["points"])
+    return f"{p}/{a['max']:g} points" if isinstance(a.get("max"), (int, float)) else f"{p} points"
+
+
 class AssignmentsView(View):
-    hint = "Enter details / take Form"
+    hint = "Enter details · o open in Teams · D show done · r reload · / filter"
+    BUCKETS = (("due", "To do"), ("missed", "Missed"), ("done", "Done"))
 
     def __init__(self, app):
         super().__init__(app, "Assignments")
+        self.show_done = False
+        self.items = None
 
     def build(self):
-        self.app.status(dim("loading assignments from Teams…"))
-        try:
-            items = self.sh.web.assignments()
-        except TeamsError as e:
-            return wrap_rows(red(str(e)), "  ")
-        if not items:
-            return text_rows(dim("  No assignments were shown by Teams (or it did not load). Press r to try again."))
-        rows, now = [], datetime.now().astimezone()
-        for a in items:
-            due = a["due"]
-            late = False
-            try:
-                late = due and datetime.fromisoformat(due.replace("Z", "+00:00")) < now
-            except ValueError:
-                pass
-            when = fmt_time(due) if due else "no due date"
-            st = a["status"].lower()
-            mark = green("✓ ") if st in ("submitted", "returned", "turnedin") else (red("! ") if late else "  ")
-            rows.append(Row(f"{mark}{bold(a['title'])}  {(red if late else dim)(when)}"
-                            + (dim(f"  · {a['class']}") if a["class"] else "")
-                            + (yellow("  ▶ Form") if a["forms"] else ""), a))
+        if self.items is None or self.fresh:
+            self.app.status(dim("loading your assignments…"))
+            self.items = self.sh.web.assignments()
+        self.fresh = False
+        groups = {k: [a for a in self.items if a["bucket"] == k] for k, _ in self.BUCKETS}
+        groups["missed"].reverse()                      # most recent first
+        groups["done"].sort(key=lambda a: a["due"] or "", reverse=True)
+        rows = []
+        for k, label in self.BUCKETS:
+            items = groups[k]
+            if rows:
+                rows.append(Row(""))
+            rows.append(head(f"{label}  ·  {len(items)}"))
+            if k == "done" and not self.show_done:
+                if items:
+                    rows.append(Row(dim(f"  + {len(items)} done  (D shows them)"), {"toggle": True}))
+                continue
+            if not items:
+                rows.append(Row(dim("  nothing here" if k != "due" else "  nothing to do right now")))
+            for a in items:
+                rows.append(self.row(a))
         return rows
 
+    def row(self, a):
+        mark = {"due": yellow("○"), "missed": red("✗"), "done": green("✓")}[a["bucket"]]
+        when = (red if a["bucket"] == "missed" else dim)(fmt_due(a["due"]))
+        extra = (yellow("  ▶ Form") if a["forms"] else "") + (f"  {green(score_text(a))}" if score_text(a) else "")
+        title = a["title"].strip()
+        title = title if len(title) <= 46 else title[:45] + "…"
+        cls = cyan(a["class"][:16].ljust(16)) if a["class"] else " " * 16
+        return Row(f"  {mark} {bold(title.ljust(46))}  {cls}  {when}{extra}", a)
+
+    def load(self):
+        self.fresh = getattr(self, "fresh", False)
+        super().load()
+
+    def toggle(self):
+        self.show_done = not self.show_done
+        self.all_rows = self.build()
+        self.apply_filter(self.sel)
+
+    def key(self, k, a):
+        if k == "D":
+            self.toggle()
+            return True
+        if k in ("r", curses.KEY_F5):
+            self.fresh = True
+            self.app.load(self)
+            return True
+        if k == "o" and a and a.get("web"):
+            subprocess.Popen(["xdg-open", a["web"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            self.app.msg = green("opened in Teams in your browser")
+            return True
+        return False
+
     def enter(self, a):
+        if a.get("toggle"):
+            return self.toggle()
+
         def b():
-            rows = [Row(f"  {bold(a['title'])}"), Row(dim(f"  {a['class']}  ·  due {fmt_time(a['due'])}  ·  {a['status']}"
-                                                         + (f"  ·  {a['points']} points" if a['points'] else ""))), Row("")]
+            label = {"due": yellow("to do"), "missed": red("missed"), "done": green("done")}[a["bucket"]]
+            rows = [Row(f"  {bold(magenta(a['title']))}"),
+                    Row(f"  {label}  ·  {dim(a['class'] or 'class unknown')}  ·  {dim('due ' + fmt_due(a['due']))}"
+                        + (f"  ·  {green(score_text(a))}" if score_text(a) else "")), Row("")]
             rows += wrap_rows(a["text"] or dim("(no instructions)"), "  ")
             if a["forms"]:
                 rows += [Row(""), head("Forms test")] + [form_row(u, {"label": a["title"]}, "  ") for u in a["forms"]]
+            if a.get("web"):
+                rows += [Row(""), Row(f"  {blue('↗ open in Teams')}", {"link": a["web"]})]
             return rows
+
+        def go(d):
+            if "form" in d:
+                return self.app.run_form(d["form"])
+            subprocess.Popen(["xdg-open", d["link"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            self.app.msg = green("opened in Teams in your browser")
         v = TextView(self.app, a["title"][:40], b, "Enter on ▶ Form: take the test")
-        v.enter = lambda d: self.app.run_form(d["form"])
+        v.enter = go
         self.app.push(v)
 
 
