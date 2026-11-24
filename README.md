@@ -34,8 +34,13 @@ Run the same command again to update.
 
 ```sh
 teams login     # e-mail, password, MFA in the terminal
-teams           # interactive shell, type "help"
+teams           # full-screen view, press ? for keys
+teams shell     # command prompt, type "help"
 ```
+
+The Courses tab lists only the teams you are a member of for the current school year. The list comes from Teams itself and is cached, so it shows at once on the next start. Press `A` to show earlier years and archived teams, `r` to reload. In the shell, `teams --all` and `teams --sites` widen the list.
+
+Forms tests run full screen. ↑ ↓ pick an answer, Space ticks it, Enter goes on, ← goes back. A progress bar shows answered questions. Before submitting you see all answers, with missing required ones marked. After submitting, the score shows when the quiz reports one.
 
 ## Uninstall
 

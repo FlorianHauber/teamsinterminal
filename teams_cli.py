@@ -28,7 +28,7 @@ from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "1.0"
+VERSION = "1.1"
 APP = "teams-cli"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / APP
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -141,6 +141,115 @@ def parse_nums(tokens, maximum):
 
 def norm(s):
     return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+# --------------------------------------------------------------------------- #
+#  School years and course names ("2026_27_2IHIF_ ENGLISH" -> English, 26/27)
+# --------------------------------------------------------------------------- #
+
+YEAR_PAIR_RE = re.compile(r"(?<!\d)(?:20)?(\d{2})\s*[/_\-. ]?\s*(?:20)?(\d{2})(?!\d)")
+CLASS_RE = re.compile(r"(?<![A-Za-z0-9])\d[A-Za-z]{3,5}(?![A-Za-z])")
+
+
+def school_year(now=None):
+    """Start year of the current school year (it starts in September; August already counts)."""
+    now = now or datetime.now()
+    return now.year - (0 if now.month >= 8 else 1)
+
+
+def school_label(y=None):
+    y = school_year() if y is None else y
+    return f"{y % 100:02d}/{(y + 1) % 100:02d}"
+
+
+def title_years(title):
+    """School years named in a team title: '2526', '25-26', '2025/26', '2026_27' -> {2025} or {2026}."""
+    out = set()
+    for m in YEAR_PAIR_RE.finditer(str(title)):
+        a, b = int(m[1]), int(m[2])
+        if b == (a + 1) % 100:
+            out.add(2000 + a)
+    return out
+
+
+def class_code(title):
+    m = CLASS_RE.search(YEAR_PAIR_RE.sub(" ", str(title)))
+    return m[0].upper() if m else ""
+
+
+def course_name(title):
+    """Readable subject name: year and class code removed, SHOUTING turned into Title Case."""
+    t = YEAR_PAIR_RE.sub(lambda m: " " if int(m[2]) == (int(m[1]) + 1) % 100 else m[0], str(title))
+    t = CLASS_RE.sub(" ", t)
+    t = re.sub(r"\s+", " ", re.sub(r"[_\-/]+", " ", t)).strip(" .")
+    if not t:
+        return class_code(title) or str(title)
+    words = []
+    for w in t.split(" "):
+        if w.isupper() and len(w) > 5 or w.islower() and len(w) > 3:
+            w = w.capitalize()
+        words.append(w)
+    return " ".join(words)
+
+
+# --------------------------------------------------------------------------- #
+#  Single key presses (for the Forms runner)
+# --------------------------------------------------------------------------- #
+
+_ESC_KEYS = {b"[A": "up", b"[B": "down", b"[C": "right", b"[D": "left", b"OA": "up", b"OB": "down",
+             b"OC": "right", b"OD": "left", b"[H": "home", b"[F": "end", b"[Z": "btab"}
+
+
+def read_key():
+    """One key press as a name ('up', 'enter', 'space', 'esc', 'tab', 'backspace') or the character."""
+    import select
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = os.read(fd, 1)
+        if ch == b"\x1b":
+            seq = b""
+            while select.select([fd], [], [], 0.04)[0]:
+                seq += os.read(fd, 1)
+                if (len(seq) >= 2 and seq[-1:].isalpha()) or seq[-1:] == b"~":
+                    break
+            return _ESC_KEYS.get(seq, "esc" if not seq else "")
+        if ch in (b"\r", b"\n"):
+            return "enter"
+        if ch == b" ":
+            return "space"
+        if ch == b"\t":
+            return "tab"
+        if ch in (b"\x7f", b"\x08"):
+            return "backspace"
+        if ch == b"\x03":
+            raise KeyboardInterrupt
+        if ch == b"\x04":
+            raise EOFError
+        if ch[0] >= 0xC0:                       # rest of a UTF-8 character
+            ch += os.read(fd, 1 if ch[0] < 0xE0 else 2 if ch[0] < 0xF0 else 3)
+        return ch.decode("utf-8", "replace")
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def prefilled_input(prompt, text=""):
+    """input() with `text` already typed in, so Enter keeps it and the arrow keys edit it."""
+    try:
+        import readline
+    except ImportError:
+        readline = None
+    if readline and text:
+        readline.set_startup_hook(lambda: readline.insert_text(text))
+    try:
+        s = input(prompt)
+    finally:
+        if readline:
+            readline.set_startup_hook()
+    return text if not readline and not s else s
 
 
 class TeamsError(Exception):
@@ -553,6 +662,10 @@ FORMS_ERRORS = r"""
 """
 
 
+FORM_CLEAR = "\033[H\033[2J\033[3J"
+FORM_NAV = {"left": "back", "b": "back", "backspace": "back", "r": "review", "o": "open", "q": "quit", "esc": "quit"}
+
+
 def _wrap(text, indent="   "):
     import textwrap
     return "\n".join(textwrap.fill(line, width() - len(indent), initial_indent=indent, subsequent_indent=indent)
@@ -563,6 +676,9 @@ class FormRunner:
     def __init__(self, browser, url):
         self.b, self.url = browser, url
         self.pg = None
+        self.title, self.desc = "Microsoft Form", ""
+        self.flash = []           # messages shown on top of the next screen
+        self.page_no = 1
 
     def q(self, tag):
         return self.pg.locator(f'[data-tcli="{tag}"]')
@@ -604,191 +720,300 @@ class FormRunner:
         self.pg.wait_for_timeout(1500)
 
     def header(self):
-        title = self.pg.evaluate("""() => {
+        self.title, self.desc = self.pg.evaluate("""() => {
           const t = document.querySelector('[data-automation-id="formTitle"]') || document.querySelector('h1');
           const d = document.querySelector('[data-automation-id="formDescription"]');
           return [(t && t.innerText || document.title || '').trim(), (d && d.innerText || '').trim()];
         }""")
-        print()
-        print(bold(title[0] or "Microsoft Form"))
-        if title[1]:
-            print(_wrap(title[1], "  "))
-        print(dim("─" * min(width(), 80)))
+        self.title = self.title or "Microsoft Form"
+
+    # -- screen ------------------------------------------------------------- #
+    @staticmethod
+    def answered(q):
+        return any(c["checked"] for c in q.get("choices") or []) or bool(q.get("value"))
+
+    @staticmethod
+    def answer_text(q):
+        if q.get("choices"):
+            return ", ".join(c["label"] for c in q["choices"] if c["checked"])
+        return q.get("value") or ""
+
+    def frame(self, body, keys, qs=None, n=None):
+        """Clear the terminal and draw: title, progress bar, body, key line."""
+        W = min(width(), 92)
+        right = f"page {self.page_no}" + (f" · question {n} of {len(qs)}" if n and qs else "")
+        title = self.title[:max(10, W - len(right) - 5)]
+        out = [FORM_CLEAR, " " + bold(magenta(title)) + " " * max(2, W - len(title) - len(right) - 2) + dim(right)]
+        if qs:
+            done = sum(1 for q in qs if self.answered(q))
+            fill = round((W - 2) * done / len(qs))
+            out.append(" " + green("━" * fill) + dim("━" * (W - 2 - fill)))
+        else:
+            out.append(" " + dim("─" * (W - 2)))
+        out.append("")
+        out += ["  " + red("! " + f) for f in self.flash]
+        self.flash = []
+        out += body
+        out += ["", " " + "   ".join(bold(cyan(k)) + " " + dim(label) for k, label in keys)]
+        sys.stdout.write("\n".join(out) + "\n")
+        sys.stdout.flush()
+
+    def q_body(self, n, q, cur=None):
+        import textwrap
+        W = min(width(), 92)
+        lines = q["title"].splitlines() or [""]
+        first = re.sub(r"^\d+[.)]\s*", "", lines[0]).rstrip(" *")
+        req = red(" *") if q["required"] else ""
+        wrapped = textwrap.wrap(first, W - 8) or [""]
+        out = [f"  {cyan(bold(f'{n:>2}'))}  {bold(wrapped[0])}" + (req if len(wrapped) == 1 else "")]
+        out += ["      " + bold(w) for w in wrapped[1:]]
+        if len(wrapped) > 1:
+            out[-1] += req
+        rest = "\n".join(lines[1:]).strip()
+        if rest:
+            out += ["      " + w for line in rest.split("\n") for w in (textwrap.wrap(line, W - 8) or [""])]
+        if q["imgs"]:
+            out.append("      " + yellow(f"▣ {q['imgs']} image(s) in this question: press o to see them in your browser"))
+        out.append("")
+        multi = q["type"] == "checkbox"
+        for j, c in enumerate(q.get("choices") or []):
+            mark = (green("■") if c["checked"] else "□") if multi else (green("◉") if c["checked"] else "○")
+            here = j == cur
+            label = c["label"] or dim("(no text)")
+            out.append(f"     {magenta('❯') if here else ' '} {mark} {dim(f'{j + 1}.')} "
+                       + (bold(label) if here else green(label) if c["checked"] else label))
+        return out
 
     # -- one question ------------------------------------------------------- #
-    def show_q(self, n, q):
-        req = red(" *") if q["required"] and not q["title"].rstrip().endswith("*") else ""
-        print(f"\n{cyan(str(n) + '.')} {bold(re.sub(r'^\d+[.)]\s*', '', q['title'].splitlines()[0]))}{req}")
-        rest = "\n".join(q["title"].splitlines()[1:]).strip()
-        if rest:
-            print(_wrap(rest))
-        if q["imgs"]:
-            print(dim(f"   ({q['imgs']} image(s) in this question: type `o` to see the form in your browser)"))
-        for j, c in enumerate(q.get("choices") or []):
-            mark = ("[x]" if c["checked"] else "[ ]") if q["type"] == "checkbox" else ("(•)" if c["checked"] else "( )")
-            print(f"   {green(mark) if c['checked'] else mark} {j + 1}. {c['label']}")
+    def refresh(self, q):
+        return next((x for x in self.scan() if x["i"] == q["i"]), q)
 
-    def answer_q(self, n, q):
+    def answer_q(self, n, q, qs=None):
         """Returns 'next', 'back', 'review', 'open' or 'quit'."""
-        self.show_q(n, q)
+        qs = qs or [q]
         t = q["type"]
-        keys = dim("  Enter keep · b back · r review/submit · o open in browser · q quit")
         if t in ("radio", "checkbox"):
-            hint = "number" if t == "radio" else "numbers, e.g. 1 3"
-            print(keys)
-            while True:
-                s = input(f"   {hint} > ").strip()
-                if s.lower() in ("b", "r", "o", "q"):
-                    return {"b": "back", "r": "review", "o": "open", "q": "quit"}[s.lower()]
-                if not s:
-                    return "next"
-                try:
-                    picks = parse_nums(s.replace(",", " ").split(), len(q["choices"]))
-                except TeamsError as e:
-                    err(e)
-                    continue
-                if t == "radio" and len(picks) != 1:
-                    err("pick exactly one")
-                    continue
-                for j, c in enumerate(q["choices"]):
-                    want = (j + 1) in picks
-                    if t == "checkbox" and want != c["checked"]:
-                        self.tick(f"q{q['i']}o{j}")
-                    elif t == "radio" and want and not c["checked"]:
-                        self.tick(f"q{q['i']}o{j}")
-                if q.get("other"):
-                    chosen = [q["choices"][p - 1]["label"] for p in picks]
-                    if any(re.match(r"^(other|sonstige|andere)", c, re.I) for c in chosen):
-                        self.q(q["other"]).first.fill(input("   other: "))
-                return "next"
+            return self.ask_choice(n, q, qs, self.pick_choice)
         if t in ("text", "long", "number", "date", "time"):
-            if q.get("value"):
-                print(f"   current: {green(q['value'])}")
-            fmt = {"date": " (as shown in the form, e.g. 24.11.2026)", "time": " (e.g. 14:30)"}.get(t, "")
-            print(keys + (dim("  · e = write in $EDITOR") if t == "long" else ""))
-            s = input(f"   answer{fmt} > ")
-            if s.strip().lower() in ("b", "r", "o", "q"):
-                return {"b": "back", "r": "review", "o": "open", "q": "quit"}[s.strip().lower()]
-            if t == "long" and s.strip() == "e":
-                s = edit_text(q.get("value") or "")
-            if s:
-                self.q(q["field"]).first.fill(s)
-            return "next"
+            return self.ask_text(n, q, qs)
         if t == "dropdown":
-            print(keys)
-            self.q(q["field"]).first.click()
-            self.pg.wait_for_timeout(500)
-            opts = self.pg.locator("[role=option]")
-            labels = [opts.nth(k).inner_text().strip() for k in range(opts.count())]
-            for k, l in enumerate(labels):
-                print(f"   {k + 1}. {l}")
-            s = input("   number > ").strip()
-            if s.isdigit() and 1 <= int(s) <= len(labels):
-                opts.nth(int(s) - 1).click()
-            else:
-                self.pg.keyboard.press("Escape")
-                if s.lower() in ("b", "r", "o", "q"):
-                    return {"b": "back", "r": "review", "o": "open", "q": "quit"}[s.lower()]
-            return "next"
+            return self.ask_dropdown(n, q, qs)
         kind = "a file upload" if t == "upload" else "a question type (rating, ranking, Likert…)"
-        print(yellow(f"   This is {kind} the terminal cannot fill."))
-        print(dim("   o = finish this form in your browser (nothing has been submitted yet) · Enter = skip"))
-        s = input("   > ").strip().lower()
-        return {"o": "open", "b": "back", "r": "review", "q": "quit"}.get(s, "next")
+        body = self.q_body(n, q) + ["  " + yellow(f"This is {kind} the terminal cannot fill."),
+                                    "  " + dim("Nothing has been submitted yet. Press o to finish the form in your browser.")]
+        self.frame(body, [("o", "browser"), ("→", "skip"), ("←", "back"), ("r", "review"), ("q", "quit")], qs, n)
+        k = read_key()
+        return FORM_NAV.get(k) or "next"
+
+    def ask_choice(self, n, q, qs, apply):
+        multi = q["type"] == "checkbox"
+        cur = next((j for j, c in enumerate(q["choices"]) if c["checked"]), 0)
+        keys = [("↑↓", "move"), ("space", "tick" if multi else "choose"),
+                ("enter", "next" if multi else "choose + next"), ("→", "skip"), ("←", "back"),
+                ("r", "review"), ("o", "browser"), ("q", "quit")]
+        while True:
+            qs = [q if x["i"] == q["i"] else x for x in qs]
+            self.frame(self.q_body(n, q, cur), keys, qs, n)
+            k = read_key()
+            nc = len(q["choices"])
+            if k in ("up", "k"):
+                cur = (cur - 1) % nc
+            elif k in ("down", "j"):
+                cur = (cur + 1) % nc
+            elif k in ("home", "g"):
+                cur = 0
+            elif k in ("end", "G"):
+                cur = nc - 1
+            elif k.isdigit() and 1 <= int(k) <= nc:
+                cur = int(k) - 1
+                q = apply(q, cur)
+            elif k == "space":
+                q = apply(q, cur)
+            elif k == "enter":
+                if not multi and not q["choices"][cur]["checked"]:
+                    q = apply(q, cur)
+                return "next"
+            elif k in ("right", "tab"):
+                return "next"
+            elif k in FORM_NAV:
+                return FORM_NAV[k]
+
+    def pick_choice(self, q, j):
+        self.tick(f"q{q['i']}o{j}")
+        self.pg.wait_for_timeout(150)
+        q2 = self.refresh(q)
+        c = q2["choices"][j] if j < len(q2.get("choices") or []) else None
+        if c and c["checked"] and q2.get("other") and re.match(r"^(other|sonstige|andere)", c["label"], re.I):
+            s = prefilled_input("     other: ", q2.get("otherValue") or "")
+            self.q(q2["other"]).first.fill(s)
+            q2 = self.refresh(q2)
+        return q2
+
+    def ask_text(self, n, q, qs):
+        t = q["type"]
+        hint = {"date": "as the form shows it, e.g. 24.11.2026", "time": "e.g. 14:30",
+                "number": "a number"}.get(t, "")
+        keys = [("enter", "save + next"), (":b", "back"), (":r", "review"), (":o", "browser"), (":q", "quit")]
+        if t == "long":
+            keys.insert(1, (":e", "write in $EDITOR"))
+        body = self.q_body(n, q)
+        if hint:
+            body.append("      " + dim(hint))
+        self.frame(body, keys, qs, n)
+        old = q.get("value") or ""
+        s = prefilled_input("     › ", old)
+        cmd = s.strip().lower()
+        if cmd in (":b", ":r", ":o", ":q"):
+            return {":b": "back", ":r": "review", ":o": "open", ":q": "quit"}[cmd]
+        if t == "long" and cmd == ":e":
+            s = edit_text(old)
+        if s != old:
+            self.q(q["field"]).first.fill(s)
+        return "next"
+
+    def ask_dropdown(self, n, q, qs):
+        field = self.q(q["field"]).first
+        field.click()
+        self.pg.wait_for_timeout(500)
+        opts = self.pg.locator("[role=option]")
+        labels = [opts.nth(k).inner_text().strip() for k in range(opts.count())]
+        self.pg.keyboard.press("Escape")
+        if not labels:
+            self.flash.append("this drop-down has no options")
+            return "next"
+        fake = dict(q, type="radio", choices=[{"label": l, "checked": l == q.get("value")} for l in labels])
+
+        def apply(fq, j):
+            field.click()
+            self.pg.wait_for_timeout(400)
+            self.pg.locator("[role=option]").nth(j).click()
+            self.pg.wait_for_timeout(200)
+            return dict(fq, value=labels[j], choices=[dict(c, checked=k == j) for k, c in enumerate(fq["choices"])])
+        return self.ask_choice(n, fake, qs, apply)
 
     # -- whole form --------------------------------------------------------- #
+    def leave(self):
+        return confirm("  Leave without submitting? Your answers are not sent.", True)
+
     def run(self):
+        if not sys.stdin.isatty():
+            raise TeamsError("Forms tests need a terminal")
+        print(dim("opening the form…"))
         self.open()
         self.header()
         btn = self.buttons()
         if btn.get("start") and not self.scan():
             body = self.pg.inner_text("body")
             m = re.search(r"(\d+\s*(min|minute|minuten|hour|stunde)\w*)", body, re.I)
-            print(yellow("This form starts a timer when you begin" + (f" ({m[1]})." if m else ".")))
-            if not confirm("Start now?"):
+            desc = [_wrap(self.desc, "  ")] if self.desc else []
+            self.frame(desc + ["", "  " + yellow("⏱  This form starts a timer when you begin" + (f" ({m[1]})." if m else ".")),
+                               "  " + dim("Answers are only sent when you submit at the end.")],
+                       [("enter", "start now"), ("q", "cancel")])
+            if read_key() != "enter":
                 return
             self.click_btn("start")
             self.pg.wait_for_timeout(1500)
-        page_no = 0
+        self.page_no = 0
         while True:
             qs = self.scan()
-            page_no += 1
+            self.page_no += 1
             if not qs:
                 raise TeamsError("no questions found on this page (type of form not supported)")
-            print(dim(f"\n— page {page_no} · {len(qs)} question(s)"))
-            k = 0
+            k, went_back = 0, False
             while k < len(qs):
-                act = self.answer_q(k + 1, qs[k])
+                act = self.answer_q(k + 1, qs[k], qs)
+                qs = self.scan() or qs
                 if act == "quit":
-                    if confirm("Leave without submitting?", True):
+                    if self.leave():
                         return
                     continue
                 if act == "open":
                     return self.open_in_browser()
                 if act == "back":
+                    if k == 0 and self.page_no > 1 and self.buttons().get("back"):
+                        self.click_btn("back")
+                        self.page_no -= 2
+                        went_back = True
+                        break
                     k = max(0, k - 1)
                 elif act == "review":
                     break
                 else:
                     k += 1
-                qs = self.scan()
+            if went_back:
+                continue
             btn = self.buttons()
             if btn.get("next") and not btn.get("submit"):
+                first = qs[0]["title"]
                 self.click_btn("next")
                 errs = self.pg.evaluate(FORMS_ERRORS)
-                if errs and self.scan() and self.scan()[0]["title"] == qs[0]["title"]:
-                    for e in errs:
-                        err(e)
-                    page_no -= 1
+                now = self.scan()
+                if errs and now and now[0]["title"] == first:
+                    self.flash += errs
+                    self.page_no -= 1
                 continue
             if not self.review_and_submit():
+                self.page_no -= 1
                 continue
             return
 
     def review_and_submit(self):
-        qs = self.scan()
-        print(bold("\nYour answers"))
-        missing = []
-        for n, q in enumerate(qs, 1):
-            if q.get("choices"):
-                ans = ", ".join(c["label"] for c in q["choices"] if c["checked"])
-            else:
-                ans = q.get("value") or ""
-            if not ans and q["required"]:
-                missing.append(n)
-            first = re.sub(r"^\d+[.)]\s*", "", q["title"].splitlines()[0])[:60]
-            print(f"  {n:>2}. {first:<60} {green(ans[:50]) if ans else red('— no answer') if q['required'] else dim('—')}")
-        if missing:
-            print(yellow(f"Required questions without an answer: {', '.join(map(str, missing))}"))
+        import textwrap
         while True:
-            s = input(dim("s submit · <number> change that answer · o open in browser · q quit") + "\n> ").strip().lower()
+            qs = self.scan()
+            W = min(width(), 92)
+            body, missing = ["  " + bold("Check your answers"), ""], []
+            for n, q in enumerate(qs, 1):
+                ans = self.answer_text(q)
+                if not ans and q["required"]:
+                    missing.append(n)
+                mark = green("✓") if ans else red("✗") if q["required"] else dim("·")
+                first = re.sub(r"^\d+[.)]\s*", "", q["title"].splitlines()[0]).rstrip(" *")
+                body.append(f"  {mark} {dim(f'{n:>2}')}  {first[:W - 10]}")
+                shown = textwrap.shorten(ans, W - 10, placeholder="…") if ans else ""
+                body.append("        " + (green(shown) if ans else red("no answer, required") if q["required"]
+                                           else dim("no answer")))
+            if missing:
+                body += ["", "  " + yellow(f"{len(missing)} required question(s) without an answer: "
+                                           + ", ".join(map(str, missing)))]
+            self.frame(body, [("s", "submit"), ("1-" + str(len(qs)), "change an answer"), ("o", "browser"),
+                              ("q", "quit")], qs)
+            s = input("  › ").strip().lower()
             if s == "q":
-                return confirm("Leave without submitting?", True)
+                if self.leave():
+                    return True
+                continue
             if s == "o":
                 self.open_in_browser()
                 return True
             if s.isdigit() and 1 <= int(s) <= len(qs):
-                self.answer_q(int(s), qs[int(s) - 1])
-                return self.review_and_submit()
-            if s == "s":
-                break
-        btn = self.buttons()
-        if not btn.get("submit"):
-            raise TeamsError("no Submit button on this page")
-        if not confirm(bold("Submit the form now? This cannot be undone.")):
-            return self.review_and_submit()
+                self.answer_q(int(s), qs[int(s) - 1], qs)
+                continue
+            if s != "s":
+                continue
+            if not self.buttons().get("submit"):
+                raise TeamsError("no Submit button on this page")
+            if missing and not confirm(yellow(f"  {len(missing)} required answer(s) missing. Submit anyway?")):
+                continue
+            if not confirm(bold("  Submit the form now? This cannot be undone.")):
+                continue
+            break
         self.click_btn("submit")
         self.pg.wait_for_timeout(2500)
         errs = self.pg.evaluate(FORMS_ERRORS)
         if errs and self.buttons().get("submit"):
-            for e in errs:
-                err(e)
-            print(yellow("Not submitted. Fix the answers above."))
+            self.flash += errs + ["Not submitted. Fix the answers above."]
             return False
+        self.pg.wait_for_timeout(1500)
         body = self.pg.inner_text("body").strip()
-        print(green("\n✓ Submitted."))
-        tail = [l for l in body.splitlines() if l.strip()][:12]
-        print(_wrap("\n".join(tail), "  "))
+        lines = [l.strip() for l in body.splitlines() if l.strip()]
+        score = re.search(r"(\d+(?:[.,]\d+)?)\s*/\s*(\d+(?:[.,]\d+)?)\s*(?:points?|punkte?|pkt|pts)", body, re.I) or \
+            re.search(r"(?:points?|punkte?)\s*:?\s*(\d+(?:[.,]\d+)?)\s*/\s*(\d+(?:[.,]\d+)?)", body, re.I)
+        out = ["  " + green(bold("✓ Submitted")), ""]
+        if score:
+            out += ["  " + bold(f"Score  {score[1]} / {score[2]}"), ""]
+        out += [_wrap("\n".join(lines[:12]), "  ")]
+        self.frame(out, [])
         return True
 
     def open_in_browser(self):
@@ -902,6 +1127,58 @@ class TeamsWeb:
         self.ready = False
         self.error = None
         self.forms = {}          # url -> {"label", "where"}
+        self.auth = None         # (csa base url, headers) copied from a request the page made
+        self.team_list = None    # the teams you are a member of, as Teams itself lists them
+
+    def _on_request(self, r):
+        if self.auth or "/api/csa/" not in r.url:
+            return
+        try:
+            h = r.headers
+        except Exception:
+            return
+        if "authorization" in h:
+            base = r.url.split("/api/csa/")[0] + "/api/csa/" + r.url.split("/api/csa/")[1].split("/")[0]
+            keep = ("authorization", "x-ms-client-version", "x-ms-region", "x-ringoverride")
+            self.auth = (base, {k: v for k, v in h.items() if k in keep})
+
+    def fetch_team_list(self):
+        """Ask Teams for the full list of your teams (archived flag, class type, SharePoint site, channels)."""
+        if not self.auth:
+            return None
+        base, h = self.auth
+        r = self.b.ctx.request.get(base + "/api/v3/teams/users/me?isPrefetch=false&enableMembershipSummary=true",
+                                   headers=h, fail_on_status_code=False)
+        if r.status != 200:
+            if r.status == 401:
+                self.auth = None          # token expired; the page makes a new request soon
+            return None
+        text = r.text()
+        data = json.loads(text)
+        self.caps.append({"url": base + "/api/v3/teams/users/me", "host": urllib.parse.urlparse(base).hostname,
+                          "data": data, "text": text})
+        self.team_list = data.get("teams") or []
+        return self.team_list
+
+    def joined(self):
+        out = []
+        for t in self.team_list or []:
+            if t.get("isDeleted") or not isinstance(t, dict):
+                continue
+            tsi = t.get("teamSiteInformation") if isinstance(t.get("teamSiteInformation"), dict) else {}
+            out.append({"name": t.get("displayName") or "", "id": t.get("id"), "groupId": tsi.get("groupId"),
+                        "site": (tsi.get("sharepointSiteUrl") or "").rstrip("/"), "archived": bool(t.get("isArchived")),
+                        "type": t.get("teamType"), "desc": t.get("description") or ""})
+        return out
+
+    def reload_list(self):
+        if not self.ready:
+            return self.boot()
+        for _ in range(30):
+            if self.fetch_team_list() is not None:
+                return
+            self.wait(self.pg, 1)
+        raise TeamsError("Teams did not answer; try again in a moment")
 
     # -- capture ------------------------------------------------------------ #
     def _on_response(self, r):
@@ -962,13 +1239,23 @@ class TeamsWeb:
         self.b.start()
         if not self.hooked:
             self.b.ctx.on("response", self._on_response)
+            self.b.ctx.on("request", self._on_request)
             self.hooked = True
         self.pg = self.b.new_page()
         try:
             self.pg.goto("https://teams.microsoft.com/v2/", wait_until="commit", timeout=60000)
         except Exception:
             pass
-        if self.wait(self.pg, 90, lambda: len(self.teams()), stable=4):
+        end = time.time() + 90
+        while time.time() < end and not self.team_list:
+            self.wait(self.pg, 1)
+            try:
+                self.fetch_team_list()
+            except Exception:
+                pass
+        if not self.team_list:     # older way: wait until the page has loaded its own copy
+            self.wait(self.pg, max(5, end - time.time()), lambda: len(self.teams()), stable=4)
+        if self.teams():
             self.ready = True
             return
         self.error = ("the Teams web app did not load in the hidden browser, so posts and assignments are not "
@@ -1172,7 +1459,9 @@ HELP = f"""
   whoami                 show who is signed in
 
 {bold('Teams & files')}           (numbers refer to the last list shown)
-  teams [filter]         list your teams (class teams included)
+  teams [filter]         your classes of this school year
+  teams --all            also earlier years and archived teams
+  teams --sites          every team site of the school you can open
   team <n|name>          open a team and show its channel folders
   ls                     list the current folder again
   cd <n|..|/>            go into a folder, up one, or back to the team's top
@@ -1209,6 +1498,8 @@ class Shell(cmd.Cmd):
         self.sp = SharePoint(browser, self.cfg)
         self.web = TeamsWeb(browser)
         self._teams = None
+        self._joined = None
+        self.courses_note = ""
         self.listed = []          # last list of teams shown
         self.team = None
         self.lib = None
@@ -1327,28 +1618,83 @@ class Shell(cmd.Cmd):
             self._teams = self.need().team_sites()
         return self._teams
 
+    def joined(self, reload=False):
+        """Teams you are a member of. Cached in the config so the list shows at once next time."""
+        cached = self.cfg.get("joined")
+        if self._joined is None and cached and not reload:
+            self._joined = cached.get("teams") or []
+        if self._joined is None or reload:
+            info("finding the classes you are in…")
+            self.need()
+            self.web.reload_list() if reload else self.web.boot()
+            j = self.web.joined()
+            if not j:
+                raise TeamsError("Teams did not list your teams")
+            self._joined = j
+            self.cfg["joined"] = {"time": int(time.time()), "teams": j}
+            save_config(self.cfg)
+        return self._joined
+
+    def is_hidden(self, url):
+        return url.lower() in {h.lower() for h in self.cfg["hidden"]}
+
+    def courses(self, reload=False):
+        """Your teams as site dicts. `old` marks archived teams and teams of an earlier school year."""
+        keys = {k.lower(): k for k in self.cfg["subjects"]}
+        cy = school_year()
+        self.courses_note = ""
+        try:
+            src = [(j["name"], j["site"], j["archived"], j["desc"]) for j in self.joined(reload) if j.get("site")]
+        except TeamsError as e:
+            self.courses_note = f"{e}. Showing every SharePoint team site of {school_label()} instead."
+            src = [(t["title"], t["url"], False, t["desc"]) for t in self.teams(reload)
+                   if cy in title_years(t["title"])]
+        out = []
+        for title, url, archived, desc in src:
+            years = title_years(title)
+            out.append({"title": title, "url": keys.get(url.lower(), url), "channel": False, "desc": desc,
+                        "modified": None, "archived": archived, "old": archived or bool(years and cy not in years),
+                        "name": course_name(title), "code": class_code(title)})
+        out.sort(key=lambda t: t["name"].lower())
+        return out
+
     def do_refresh(self, arg):
         """Reload the team list."""
         self._teams = None
+        self.courses(reload=True)
         self.do_teams("")
 
     def do_teams(self, arg):
-        """teams [filter] — list your teams."""
-        hidden = set(self.cfg["hidden"])
-        ts = [t for t in self.teams() if t["url"] not in hidden]
-        if arg.strip():
-            f = norm(arg)
-            ts = [t for t in ts if f in norm(t["title"])]
+        """teams [--all|--sites] [filter] — list your classes of this school year."""
+        a = args_of(arg)
+        everything, sites = "--all" in a or "-a" in a, "--sites" in a
+        f = norm(" ".join(x for x in a if not x.startswith("-")))
+        if sites:
+            ts = self.teams()
+        else:
+            ts = [t for t in self.courses() if everything or not t["old"]]
+            if self.courses_note:
+                print(yellow(self.courses_note))
+        ts = [t for t in ts if not self.is_hidden(t["url"]) and (not f or f in norm(t["title"]))]
         self.listed = ts
         if not ts:
-            print(dim("no teams" + (" match" if arg.strip() else "")))
+            print(dim("no teams" + (" match" if f else "")))
             return
+        nw = min(30, max(len(t.get("name") or t["title"]) for t in ts))
         for n, t in enumerate(ts, 1):
             subj = self.cfg["subjects"].get(t["url"])
-            tag = dim(" (private channel)") if t["channel"] else ""
-            print(f"{cyan(f'{n:>3}')}  {t['title']}{tag}" + (f"  {green('→ ' + subj)}" if subj else ""))
+            name = t.get("name") or t["title"]
+            tag = yellow("  archived") if t.get("archived") else dim("  earlier year") if t.get("old") else ""
+            print(f"{cyan(f'{n:>3}')}  {bold(name.ljust(nw))}  {dim(t['title'])}{tag}"
+                  + (f"  {green('→ ' + subj)}" if subj else ""))
+        if not sites and not everything:
+            old = sum(1 for t in self.courses() if t["old"])
+            if old:
+                print(dim(f"     {old} from earlier years or archived · `teams --all` shows them"))
+        pool = self.teams() if sites else self.courses()
+        hidden = sum(1 for t in pool if self.is_hidden(t["url"]))
         if hidden:
-            print(dim(f"     {len(hidden)} hidden · `unhide` to show them"))
+            print(dim(f"     {hidden} hidden · `unhide` to show them"))
 
     def pick_team(self, arg):
         arg = arg.strip()
@@ -1361,7 +1707,9 @@ class Shell(cmd.Cmd):
             if not 1 <= n <= len(self.listed):
                 raise TeamsError(f"no team {n}")
             return self.listed[n - 1]
-        hits = [t for t in self.teams() if norm(arg) in norm(t["title"])]
+        hits = [t for t in self.courses() if norm(arg) in norm(t["title"]) or norm(arg) in norm(t["name"])]
+        if not hits:
+            hits = [t for t in self.teams() if norm(arg) in norm(t["title"])]
         if len(hits) == 1:
             return hits[0]
         if not hits:
@@ -1524,7 +1872,7 @@ class Shell(cmd.Cmd):
 
     def do_subjects(self, arg):
         """Show all team → folder mappings."""
-        names = {t["url"]: t["title"] for t in (self._teams or [])}
+        names = {t["url"]: t["title"] for t in (self._teams or []) + (self.courses() if self._joined else [])}
         if not self.cfg["subjects"]:
             print(dim("none yet — they are asked on the first download from a team"))
         for url, d in sorted(self.cfg["subjects"].items(), key=lambda x: x[1].lower()):
@@ -1582,8 +1930,10 @@ class Shell(cmd.Cmd):
         self.need()
         a = arg.strip()
         if a == "all":
-            by_url = {t["url"]: t for t in self.teams()}
-            targets = [by_url[u] for u in self.cfg["subjects"] if u in by_url]
+            by_url = {t["url"].lower(): t for t in self.courses()}
+            if any(u.lower() not in by_url for u in self.cfg["subjects"]):
+                by_url = {**{t["url"].lower(): t for t in self.teams()}, **by_url}
+            targets = [by_url[u.lower()] for u in self.cfg["subjects"] if u.lower() in by_url]
             if not targets:
                 raise TeamsError("no team has a Moodle folder yet — `team <n>` then `get` or `sync` first")
         elif a:
@@ -1729,6 +2079,7 @@ Moving around
 
 Actions (the bottom line shows the ones for the current screen)
   Courses              s  download all files of the team   m  choose its ~/Moodle folder   x  hide it
+                       A  show classes of earlier years and archived teams
   Team / folder        Enter open   d  download   a  download everything here   o  open file
   Channel              Enter on a post: read it with replies   Enter on ▶ Form: take the test
   Forms                Enter take the test in the terminal   p  paste a Forms link
@@ -1736,8 +2087,11 @@ Actions (the bottom line shows the ones for the current screen)
 
 Files go to ~/Moodle/<subject> (the same folder moodle-cli uses). The subject folder
 is asked once per team and remembered; `m` changes it.
-Forms tests: you answer each question in the terminal, then see all answers and
-confirm before anything is submitted.
+Courses lists the teams you are a member of for this school year, taken from
+Teams itself. Press r on Courses to reload that list.
+
+Forms tests: ↑ ↓ pick an answer, Space ticks it, Enter goes on, ← goes back.
+At the end you see all answers and confirm before anything is submitted.
 """
 
 
@@ -1753,12 +2107,13 @@ def char_w(ch):
 
 
 class Row:
-    __slots__ = ("text", "data", "sel")
+    __slots__ = ("text", "data", "sel", "kind")
 
-    def __init__(self, text, data=None, sel=None):
+    def __init__(self, text, data=None, sel=None, kind=""):
         self.text = str(text).replace("\t", "    ")
         self.data = data
         self.sel = data is not None if sel is None else sel
+        self.kind = kind          # "head" draws a rule after the text
 
 
 def text_rows(text):
@@ -1779,7 +2134,7 @@ def wrap_rows(text, indent="    ", limit=None):
 
 
 def head(text):
-    return Row(cyan(bold(text)), sel=False)
+    return Row("  " + cyan(bold(text)), sel=False, kind="head")
 
 
 class View:
@@ -1914,38 +2269,56 @@ def form_row(url, info=None, indent="    "):
 
 
 class CoursesView(View):
-    hint = "Enter open · s download files · m Moodle folder · x hide · / filter"
+    hint = "Enter open · s sync files · m folder · x hide · A earlier years · / filter"
 
     def __init__(self, app):
         super().__init__(app, "Courses")
+        self.show_old = False
+        self.fresh = False        # True: ask Teams again instead of using the saved list
 
     def build(self):
-        teams = self.sh.teams(reload=self.loaded)
-        hidden = set(self.sh.cfg["hidden"])
-        y = datetime.now().year - (0 if datetime.now().month >= 9 else 1)
-        yy = f"{y % 100:02d}{(y + 1) % 100:02d}"
-        cur, other = [], []
-        for t in teams:
-            if t["url"] in hidden:
-                continue
-            (cur if yy in norm(t["title"]) else other).append(t)
+        if not self.sh._joined and not self.sh.cfg.get("joined"):
+            self.app.status(dim("finding the classes you are in (the first time takes up to a minute)…"))
+        every = self.sh.courses(reload=self.fresh)
+        self.fresh = False
+        courses = [t for t in every if not self.sh.is_hidden(t["url"])]
+        hidden = len(every) - len(courses)
+        cur = [t for t in courses if not t["old"]]
+        old = [t for t in courses if t["old"]]
+        nw = min(28, max([len(t["name"]) for t in courses] or [10]))
         rows = []
-        for title, items in ((f"This school year {yy[:2]}/{yy[2:]}", cur), ("Other teams", other)):
-            if not items:
-                continue
-            if rows:
-                rows.append(Row(""))
-            rows.append(head(f"{title} ({len(items)})"))
-            for t in items:
-                subj = self.sh.cfg["subjects"].get(t["url"])
-                tag = dim("  (private channel)") if t["channel"] else ""
-                rows.append(Row(f"  {t['title']}{tag}" + (f"  {green('→ ' + subj)}" if subj else ""), t))
+        if self.sh.courses_note:
+            rows += wrap_rows(yellow(self.sh.courses_note), "  ") + [Row("")]
+        rows.append(head(f"Your classes {school_label()}  ·  {len(cur)}"))
+        rows += [self.course_row(t, nw) for t in cur] or [Row(dim("  no classes for this school year"))]
+        if old:
+            rows.append(Row(""))
+            if self.show_old:
+                rows.append(head(f"Earlier years and archived  ·  {len(old)}"))
+                rows += [self.course_row(t, nw) for t in old]
+            else:
+                rows.append(Row(dim(f"  + {len(old)} from earlier years or archived  (A shows them)"), {"toggle": True}))
         if hidden:
-            rows += [Row(""), Row(dim(f"  {len(hidden)} hidden · press X to show them again"))]
-        return rows or text_rows("No teams found for this account.")
+            rows += [Row(""), Row(dim(f"  {hidden} hidden  (X shows them again)"))]
+        return rows
+
+    def course_row(self, t, nw):
+        subj = self.sh.cfg["subjects"].get(t["url"])
+        name = t["name"][:nw]
+        tag = yellow("  archived") if t.get("archived") else ""
+        chip = f"  {green('↓ ' + subj)}" if subj else ""
+        dot = dim("○") if t["old"] else magenta("●")
+        return Row(f"  {dot} {bold(name)}{' ' * (nw - len(name) + 2)}{dim(t['title'])}{tag}{chip}", t)
 
     def enter(self, t):
+        if t.get("toggle"):
+            return self.toggle()
         self.app.push(TeamView(self.app, t))
+
+    def toggle(self):
+        self.show_old = not self.show_old
+        self.all_rows = self.build()
+        self.apply_filter(self.sel)
 
     def key(self, k, t):
         if k == "X":
@@ -1953,7 +2326,15 @@ class CoursesView(View):
             save_config(self.sh.cfg)
             self.app.load(self)
             return True
-        if t is None:
+        if k == "A":
+            self.toggle()
+            return True
+        if k in ("r", curses.KEY_F5):
+            self.fresh = True
+            self.app.load(self)
+            self.app.msg = self.app.msg or green("✓ class list reloaded from Teams")
+            return True
+        if t is None or t.get("toggle"):
             return False
         if k == "s":
             self.app.sync_team(t)
@@ -1964,7 +2345,7 @@ class CoursesView(View):
             self.sh.cfg["hidden"].append(t["url"])
             save_config(self.sh.cfg)
             self.app.load(self)
-            self.app.msg = f"hidden {t['title']} (X shows hidden teams again)"
+            self.app.msg = f"hidden {t['name']} (X shows hidden teams again)"
         else:
             return False
         return True
@@ -1974,14 +2355,15 @@ class TeamView(View):
     hint = "Enter open · d download · a download all files · m Moodle folder"
 
     def __init__(self, app, t):
-        super().__init__(app, t["title"])
+        super().__init__(app, t.get("name") or t["title"])
         self.t = t
 
     def build(self):
         rows = []
         subj = self.sh.cfg["subjects"].get(self.t["url"])
-        rows.append(Row(dim(f"  files → {moodle_root(self.sh.cfg) / subj}" if subj else
-                            "  files → no ~/Moodle folder yet (asked on the first download, or press m)")))
+        rows.append(Row(f"  {bold(magenta(self.t.get('name') or self.t['title']))}   {dim(self.t['title'])}"))
+        rows.append(Row("  " + (green(f"↓ {moodle_root(self.sh.cfg) / subj}") if subj else
+                                dim("↓ no ~/Moodle folder yet (asked on the first download, or press m)"))))
         rows.append(Row(""))
         rows.append(head("Channels"))
         web = self.sh.web
@@ -1992,7 +2374,7 @@ class TeamView(View):
                 wt = web.match(self.t["title"])
                 if wt:
                     for ch in wt["channels"]:
-                        rows.append(Row(f"  # {ch['name']}", {"channel": ch, "wt": wt}))
+                        rows.append(Row(f"  {cyan('#')} {ch['name']}", {"channel": ch, "wt": wt}))
                 else:
                     rows.append(Row(dim("  this team was not found in the Teams web app")))
             except TeamsError as e:
@@ -2008,8 +2390,9 @@ class TeamView(View):
             for it in self.sh.sp.folder(self.t["url"], self.lib["path"]):
                 rows.append(item_row(it))
             for l in libs[1:]:
-                rows.append(Row(f"  {blue('▣ ' + l['title'])}  {dim(str(l['count']) + ' items')}",
-                                {"kind": "dir", "name": l["title"], "path": l["path"], "count": l["count"]}))
+                r = item_row({"kind": "dir", "name": l["title"], "path": l["path"], "count": l["count"]})
+                r.text = r.text.replace("▸", "▣", 1)
+                rows.append(r)
         else:
             rows.append(Row(dim("  no files you can see")))
         return rows
@@ -2038,10 +2421,18 @@ class TeamView(View):
         return True
 
 
+FILE_ICONS = {"pdf": "▤", "doc": "¶", "docx": "¶", "odt": "¶", "ppt": "◧", "pptx": "◧", "xls": "▦", "xlsx": "▦",
+              "csv": "▦", "png": "◩", "jpg": "◩", "jpeg": "◩", "gif": "◩", "zip": "◫", "mp4": "▶", "mp3": "♪"}
+
+
 def item_row(it, indent="  "):
+    nw = max(24, min(56, width() - 40))
+    name = it["name"] if len(it["name"]) <= nw else it["name"][:nw - 1] + "…"
+    pad = " " * (nw - len(name) + 2)
     if it["kind"] == "dir":
-        return Row(f"{indent}{blue('▸ ' + it['name'] + '/')}  {dim(str(it['count']) + ' items')}", it)
-    return Row(f"{indent}  {it['name']}  {dim(human(it['size']) + '  ' + fmt_time(it['modified']))}", it)
+        return Row(f"{indent}{blue('▸')} {blue(bold(name))}{pad}{dim(str(it['count']) + ' items')}", it)
+    icon = FILE_ICONS.get(it["name"].rsplit(".", 1)[-1].lower() if "." in it["name"] else "", "·")
+    return Row(f"{indent}{dim(icon)} {name}{pad}{dim(human(it['size']).rjust(9) + '   ' + fmt_time(it['modified']))}", it)
 
 
 class FolderView(View):
@@ -2230,7 +2621,7 @@ class TUI:
         return self.stacks[self.tab][-1]
 
     def body_h(self):
-        return max(1, self.h - 3)
+        return max(1, self.h - 4)
 
     def run(self):
         import locale
@@ -2254,6 +2645,15 @@ class TUI:
                 curses.init_pair(i, i, -1)
         except curses.error:
             pass
+
+        def cp(n):
+            try:
+                return curses.color_pair(n) if curses.has_colors() else 0
+            except curses.error:
+                return 0
+        R, B, D = curses.A_REVERSE, curses.A_BOLD, curses.A_DIM
+        self.attrs = {"brand": cp(5) | R | B, "tab_on": cp(6) | R | B, "tab_off": D, "dim": D, "bold": B,
+                      "accent": cp(6) | B, "rule": cp(6) | D, "sel": cp(5) | R | B, "key": cp(6) | B}
         try:
             curses.mousemask(curses.ALL_MOUSE_EVENTS)
             curses.mouseinterval(0)
@@ -2452,8 +2852,8 @@ class TUI:
             return
         if my == 1:
             return self.pop()
-        idx = v.top + my - 2
-        if 2 <= my < 2 + self.body_h() and idx < len(v.rows) and v.rows[idx].sel:
+        idx = v.top + my - 3
+        if 3 <= my < 3 + self.body_h() and idx < len(v.rows) and v.rows[idx].sel:
             if idx == v.sel or b & curses.BUTTON1_DOUBLE_CLICKED:
                 v.enter(v.current)
             else:
@@ -2538,6 +2938,7 @@ class TUI:
         return col
 
     def put_ansi(self, y, x, text, extra=0, fill=False):
+        """Draw text with ANSI colours; returns the column after it."""
         attr, pos, col = 0, 0, x
         segs = []
         for m in ANSI_RE.finditer(text):
@@ -2560,39 +2961,71 @@ class TUI:
                 col = self.put(y, col, seg, a | extra)
         if fill and col < self.w - 1:
             self.put(y, col, " " * (self.w - 1 - col), extra)
+        return col
 
     def draw(self):
-        scr = self.scr
+        scr, A = self.scr, self.attrs
         self.h, self.w = scr.getmaxyx()
         scr.erase()
-        x, self.tab_pos = 0, []
+        # top bar: brand, tabs, school year
+        x = self.put(0, 0, " ◆ teams ", A["brand"]) + 1
+        self.tab_pos = []
         for i, (name, _) in enumerate(self.TABS):
-            a = curses.A_REVERSE | curses.A_BOLD if i == self.tab else curses.A_DIM
-            nx = self.put(0, x, f" {i + 1} {name} ", a)
+            nx = self.put(0, x, f" {i + 1} {name} ", A["tab_on"] if i == self.tab else A["tab_off"])
             self.tab_pos.append((x, nx))
             x = nx + 1
+        right = f" school year {school_label()} "
+        if x + len(right) < self.w - 1:
+            self.put(0, self.w - 1 - len(right), right, A["dim"])
         if self.stacks[self.tab] is None:
             scr.refresh()
             return
         v = self.view
-        crumbs = " › ".join(s.title for s in self.stacks[self.tab])
+        # breadcrumb and rule
+        stack = self.stacks[self.tab]
+        x = 1
+        for j, s in enumerate(stack):
+            last = j == len(stack) - 1
+            x = self.put(1, x, s.title, A["bold"] if last else A["dim"])
+            if not last:
+                x = self.put(1, x, "  ›  ", A["dim"])
         if v.filter:
-            crumbs += f"   [filter: {v.filter}]"
-        self.put_ansi(1, 0, cyan(bold(crumbs)) if USE_COLOR else crumbs)
+            self.put(1, x + 3, f"/ {v.filter}", A["accent"])
+        self.put(2, 0, "─" * (self.w - 1), A["rule"])
+        # body
         v.clamp()
         bh = self.body_h()
         for i in range(bh):
             idx = v.top + i
             if idx >= len(v.rows):
                 break
-            selected = idx == v.sel
-            self.put_ansi(2 + i, 0, v.rows[idx].text, curses.A_REVERSE if selected else 0, fill=selected)
+            r, y = v.rows[idx], 3 + i
+            if idx == v.sel:
+                t = strip_ansi(r.text)
+                t = ("▸ " + t[2:]) if t.startswith("  ") else t
+                self.put(y, 0, t + " " * max(0, self.w - 1 - sum(char_w(c) for c in t)), A["sel"])
+            elif r.kind == "head":
+                col = self.put_ansi(y, 0, r.text)
+                if col + 2 < self.w - 1:
+                    self.put(y, col + 1, "─" * (self.w - 2 - col), A["rule"])
+            else:
+                self.put_ansi(y, 0, r.text)
+        # bottom line: message or key hints, position
         n = len(v.rows)
-        right = f" {v.top + 1}-{min(n, v.top + bh)}/{n} " if n > bh else ""
-        left = self.msg or dim(f"{v.hint}{'  ·  ' if v.hint else ''}← back  ? help  q quit")
-        self.put_ansi(self.h - 1, 0, left)
+        right = f" {v.top + 1}-{min(n, v.top + bh)} of {n} " if n > bh else ""
+        if self.msg:
+            self.put_ansi(self.h - 1, 1, self.msg)
+        else:
+            hint = f"{v.hint}{' · ' if v.hint else ''}← back · ? help · q quit"
+            x, stop = 1, self.w - 2 - len(right)
+            for part in hint.split(" · "):
+                k, _, label = part.partition(" ")
+                if x + len(part) + 3 > stop:
+                    break
+                x = self.put(self.h - 1, x, k, A["key"])
+                x = self.put(self.h - 1, x + 1, label, A["dim"]) + 3
         if right and len(right) < self.w - 2:
-            self.put(self.h - 1, self.w - 1 - len(right), right, curses.A_DIM)
+            self.put(self.h - 1, self.w - 1 - len(right), right, A["dim"])
         scr.refresh()
 
 
